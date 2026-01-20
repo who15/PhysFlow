@@ -1,3 +1,3 @@
-# PhysFlow-Spectrally-Decoupled-with-Dual-Field-Rectified-Flow-for-Remote-Photoplethysmography
+# PhysFlow
 
-## we will upload our code after this paper accept!
+# we will upload our code after this paper accept!
