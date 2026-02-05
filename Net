@@ -1,0 +1,492 @@
+
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+def nan2num(x, v=0.0):
+    return torch.nan_to_num(x, nan=v, posinf=v, neginf=v)
+
+def safe_std(x, dim, keepdim=True, eps=1e-6):
+    return x.std(dim=dim, keepdim=keepdim).clamp_min(eps)
+
+def sinusoidal_embedding(t, dim, device=None):
+    device = t.device if device is None else device
+    dim = max(2, dim)
+    half = dim // 2
+    freqs = torch.exp(torch.arange(half, device=device) * (-np.log(10000.0) / max(1, half - 1)))
+    ang = t.unsqueeze(1) * freqs.unsqueeze(0)
+    emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=1)
+    if dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+# -------------------------
+# BN -> GN (CRITICAL)
+# -------------------------
+def replace_bn_with_gn(module: nn.Module, gn_groups: int = 8):
+    """
+    Recursively replace BatchNorm{1,2,3}d with GroupNorm.
+    This is the key to fixing DP+small-batch eval collapse.
+    """
+    for name, child in module.named_children():
+        if isinstance(child, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            num_ch = child.num_features
+            g = min(gn_groups, num_ch)
+            while g > 1 and (num_ch % g != 0):
+                g -= 1
+            setattr(module, name, nn.GroupNorm(num_groups=g, num_channels=num_ch, eps=child.eps, affine=True))
+        else:
+            replace_bn_with_gn(child, gn_groups=gn_groups)
+    return module
+
+class SoftSpectralDecoupler(nn.Module):
+    def __init__(self, fs=30.0,
+                 f_trend_max=0.5, f_amp_min=0.7, f_amp_max=4.0,
+                 tau=0.06, learnable=False, margin=0.05):
+        super().__init__()
+        self.fs = float(fs)
+        self.f_amp_max = float(f_amp_max)
+        self.tau = float(tau)
+        self.margin = float(margin)
+        self.learnable = bool(learnable)
+
+        if self.learnable:
+            self.f_trend_max_p = nn.Parameter(torch.tensor(float(f_trend_max)))
+            self.f_amp_min_p   = nn.Parameter(torch.tensor(float(f_amp_min)))
+        else:
+            self.register_buffer("f_trend_max_b", torch.tensor(float(f_trend_max)))
+            self.register_buffer("f_amp_min_b",   torch.tensor(float(f_amp_min)))
+
+    def _cutoffs(self, device):
+        if self.learnable:
+            f_tr = self.f_trend_max_p
+            f_am = self.f_amp_min_p
+        else:
+            f_tr = self.f_trend_max_b
+            f_am = self.f_amp_min_b
+
+        f_tr = f_tr.clamp(0.05, 1.50)
+        f_am = f_am.clamp(0.10, 2.50)
+        f_am = torch.maximum(f_am, f_tr + self.margin)
+        return f_tr.to(device), f_am.to(device)
+
+    def forward(self, y):  # [N,T]
+        y = nan2num(y, 0.0).to(torch.float32)
+        N, T = y.shape
+        Y = torch.fft.rfft(y, dim=1)
+        f = torch.fft.rfftfreq(T, d=1.0 / self.fs).to(y.device)
+
+        f_tr, f_am = self._cutoffs(y.device)
+        tau = max(1e-4, self.tau)
+
+        mask_low  = torch.sigmoid((f_tr - f) / tau)
+        mask_hi1  = torch.sigmoid((f - f_am) / tau)
+        mask_hi2  = torch.sigmoid((self.f_amp_max - f) / tau)
+        mask_band = mask_hi1 * mask_hi2
+
+        y_tr = torch.fft.irfft(Y * mask_low[None, :],  n=T, dim=1).to(y.dtype)
+        y_am = torch.fft.irfft(Y * mask_band[None, :], n=T, dim=1).to(y.dtype)
+        return y_am, y_tr
+
+
+class _GLUBlock(nn.Module):
+    def __init__(self, ch, dil):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
+        self.dw = nn.Conv1d(ch, ch, 3, padding=dil, dilation=dil, groups=ch, bias=False)
+        self.pw = nn.Conv1d(ch, ch * 2, 1, bias=False)
+
+    def forward(self, x, gamma):
+        r = x
+        x = self.dw(self.norm(x))
+        x = self.pw(x)
+        a, b = x.chunk(2, dim=1)
+        x = a * torch.sigmoid(b + gamma)
+        return x + r
+
+
+class AmplitudeHeadV2(nn.Module):
+    def __init__(self, T, hdim=256, tdim=64, hidden=256, blocks=3, v_max=8.0):
+        super().__init__()
+        self.T = T
+        self.tdim = tdim
+        self.v_max = float(v_max)
+        ch = hidden
+
+        self.proj_in = nn.Conv1d(2, ch, 1, bias=False)
+        self.blocks = nn.ModuleList([_GLUBlock(ch, dil=2 ** i) for i in range(blocks)])
+        self.to_out  = nn.Conv1d(ch, 1, 1)
+
+        self.te_proj = nn.Linear(tdim, ch)
+        self.h_proj  = nn.Linear(hdim, ch)
+
+        self.se = nn.Sequential(
+            nn.Linear(ch, ch // 4),
+            nn.GELU(),
+            nn.Linear(ch // 4, ch)
+        )
+
+        self.pre_scale = 0.55
+
+    def forward(self, zt, t, h_glb, c_amp):
+        x = torch.stack([zt, c_amp], dim=1)   # [N,2,T]
+        x = self.proj_in(x)
+
+        te = sinusoidal_embedding(t, self.tdim, zt.device)
+        gamma = torch.tanh(self.te_proj(te) + self.h_proj(h_glb)).unsqueeze(-1)
+
+        for blk in self.blocks:
+            x = blk(x, gamma)
+
+        se_w = torch.sigmoid(self.se(x.mean(dim=-1)))
+        x = x * (1.0 + se_w.unsqueeze(-1))
+
+        v = self.to_out(x).squeeze(1)
+        v = v * self.pre_scale
+        return torch.tanh(v) * self.v_max
+
+
+class TrendHeadV2(nn.Module):
+    def __init__(self, T, hdim=256, tdim=64, hidden=256,
+                 Kd=8, Kp=3, v_max=3.0, fs=30.0, lp_win_sec=1.2):
+        super().__init__()
+        self.T = T
+        self.Kd = Kd
+        self.Kp = Kp
+        self.v_max = float(v_max)
+        self.fs = float(fs)
+        self.lp_win_sec = float(lp_win_sec)
+
+        t = torch.arange(T).float() + 0.5
+        Bd = []
+        for k in range(Kd):
+            coef = math.sqrt(2.0 / T) if k > 0 else math.sqrt(1.0 / T)
+            Bd.append(coef * torch.cos(math.pi / T * k * t))
+        Bd = torch.stack(Bd, dim=0)
+
+        u = torch.linspace(-1.0, 1.0, T)
+        Bp = torch.stack([u ** 0, u, u ** 2], dim=0)
+        Bp = Bp / (Bp.pow(2).sum(dim=1, keepdim=True).sqrt() + 1e-6)
+
+        B = torch.cat([Bd, Bp], dim=0)
+        self.register_buffer('B', B)
+
+        self.reduce = nn.Sequential(nn.Linear(2 * T, hidden), nn.GELU())
+        self.cond = nn.Sequential(
+            nn.Linear(hidden + hdim + tdim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, B.size(0))
+        )
+        self.tproj = nn.Linear(tdim, tdim)
+
+        k = max(3, int(round(self.fs * self.lp_win_sec)) | 1)
+        self.register_buffer('lp_kernel', torch.ones(1, 1, k) / k)
+        self.pad = k // 2
+
+        decay = torch.linspace(0.0, 1.0, steps=B.size(0))
+        self.register_buffer('coef_decay', decay)
+
+        self.pre_scale = 0.33
+
+    def _lp(self, v):  # IMPORTANT: used for strict target projection
+        x = v.unsqueeze(1)
+        x = F.pad(x, (self.pad, self.pad), mode='reflect')
+        x = F.conv1d(x, self.lp_kernel.to(x.dtype).to(x.device))
+        return x.squeeze(1)
+
+    def forward(self, zt, t, h_glb, c_tr):
+        zc = torch.cat([zt, c_tr], dim=1)
+        g = self.reduce(zc)
+
+        te = sinusoidal_embedding(t, self.tproj.in_features, zt.device)
+        te = self.tproj(te)
+
+        coeff = self.cond(torch.cat([g, h_glb, te], dim=1))
+        coeff = coeff * (1.0 - 0.15 * self.coef_decay)
+
+        v = torch.matmul(coeff, self.B)
+        v = self._lp(v)
+
+        v = v * self.pre_scale
+        return torch.tanh(v) * self.v_max
+
+class TPTBackboneCond(nn.Module):
+    """
+    Uses your Fusion_Stem + patch_embedding + TPT stages.
+    Outputs:
+      h_glb: [N,d_model]
+      c_amp: [N,T]
+      c_tr : [N,T]
+      rel  : [N,T] (optional)
+    """
+    def __init__(self,
+                 T=160, fs=30.0,
+                 d_model=256,
+                 embed_dim=(64, 64, 64),
+                 depth=(2, 2, 2),
+                 mlp_ratios=(1.5, 1.5, 1.5),
+                 t_patchs=(2, 4, 8),
+                 topks=(40, 40, 40),
+                 side_dwconv=3,
+                 drop_path_rate=0.0,
+                 lp_win_sec=1.2,
+                 gn_groups=8,
+                 use_rel=True):
+        super().__init__()
+        self.T = int(T)
+        self.fs = float(fs)
+        self.d_model = int(d_model)
+        self.lp_win_sec = float(lp_win_sec)
+        self.use_rel = bool(use_rel)
+
+        self.fusion = Fusion_Stem()
+        self.patch_embedding = nn.Conv3d(64, 64, kernel_size=(1, 4, 4), stride=(1, 4, 4), bias=False)
+
+        # build stages exactly like your DDIM_3
+        self.stages = nn.ModuleList()
+        nheads = [max(1, dim // 16) for dim in embed_dim]
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depth))]
+        for i in range(len(depth)):
+            stage = TPT_Block(
+                dim=embed_dim[i],
+                depth=depth[i],
+                num_heads=nheads[i],
+                mlp_ratio=mlp_ratios[i],
+                drop_path=dp_rates[sum(depth[:i]):sum(depth[:i+1])],
+                t_patch=t_patchs[i],
+                topk=topks[i],
+                side_dwconv=side_dwconv,
+            )
+            self.stages.append(stage)
+
+        self.proj_time = nn.Conv1d(embed_dim[-1], self.d_model, kernel_size=1, bias=False)
+
+        self.cond_amp   = nn.Sequential(nn.Linear(self.d_model, self.d_model // 2), nn.GELU(), nn.Linear(self.d_model // 2, 1))
+        self.cond_trend = nn.Sequential(nn.Linear(self.d_model, self.d_model // 2), nn.GELU(), nn.Linear(self.d_model // 2, 1))
+
+        if self.use_rel:
+            self.rel_head = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model // 2),
+                nn.GELU(),
+                nn.Linear(self.d_model // 2, 1)
+            )
+        replace_bn_with_gn(self, gn_groups=gn_groups)
+
+    def _lp(self, x):  # x:[N,d,T]
+        k = max(3, int(round(self.fs * self.lp_win_sec)) | 1)
+        pad = k // 2
+        w = torch.ones(1, 1, k, device=x.device, dtype=x.dtype) / k
+        x = F.pad(x, (pad, pad), mode='reflect')
+        return F.conv1d(x, w.expand(x.size(1), 1, k), groups=x.size(1))
+
+    def forward(self, video):  # [N,T,3,H,W]
+        N, T, C, H, W = video.shape
+        assert T == self.T, f"T mismatch: got {T}, expected {self.T}"
+
+        # Fusion_Stem -> [N*T,64,h2,w2]
+        x = self.fusion(video)
+        h2, w2 = x.shape[-2], x.shape[-1]
+
+        # reshape to 3D -> [N,64,T,h2,w2]
+        x = x.view(N, T, 64, h2, w2).permute(0, 2, 1, 3, 4).contiguous()
+
+        x = self.patch_embedding(x)  # [N,64,T,h',w']
+
+        for stage in self.stages:
+            x = stage(x)
+
+        x1 = x.mean(dim=-1).mean(dim=-1)      # [N,64,T]
+        h_time = self.proj_time(x1)           # [N,d_model,T]
+
+        h_lp = self._lp(h_time)
+        h_hp = h_time - h_lp
+
+        h_glb = h_time.mean(dim=-1)           # [N,d_model]
+        c_amp = self.cond_amp(h_hp.transpose(1, 2)).squeeze(-1)    # [N,T]
+        c_tr  = self.cond_trend(h_lp.transpose(1, 2)).squeeze(-1)  # [N,T]
+
+        if self.use_rel:
+            rel = torch.sigmoid(self.rel_head(h_time.transpose(1, 2)).squeeze(-1))  # [N,T]
+        else:
+            rel = None
+        return h_glb, c_amp, c_tr, rel
+
+class RPPGRectifiedFlowDualV3_SingleStep_TPTStrictEulerGN(nn.Module):
+    """
+    forward(): returns pred_fields, target_fields, y1_hat_raw, rppg_gt, aux
+    predict(): Euler ODE integration to produce canonical waveform [N,T]
+    """
+    def __init__(self,
+                 T=160, fs=30.0, d_model=256,
+                 tdim=64, hidden=256, blocks=3,
+                 v_max_amp=8.0, v_max_tr=3.0, K_trend=8,
+                 f_trend_max=0.5, f_amp_min=0.7, f_amp_max=4.0,
+                 dec_tau=0.06, dec_learnable=False,
+                 # backbone cfg
+                 embed_dim=(64, 64, 64),
+                 depth=(2, 2, 2),
+                 mlp_ratios=(1.5, 1.5, 1.5),
+                 t_patchs=(2, 4, 8),
+                 topks=(40, 40, 40),
+                 side_dwconv=3,
+                 drop_path_rate=0.0,
+                 # rel correction
+                 rel_corrector_strength=0.0,
+                 rel_trend_only=True,
+                 # trend stability
+                 trend_std_floor=0.08,
+                 gn_groups=8):
+        super().__init__()
+        self.T = int(T)
+        self.fs = float(fs)
+        self.trend_std_floor = float(trend_std_floor)
+
+        self.backbone = TPTBackboneCond(
+            T=self.T, fs=self.fs, d_model=d_model,
+            embed_dim=embed_dim, depth=depth, mlp_ratios=mlp_ratios,
+            t_patchs=t_patchs, topks=topks, side_dwconv=side_dwconv,
+            drop_path_rate=drop_path_rate,
+            lp_win_sec=1.2, gn_groups=gn_groups, use_rel=True
+        )
+
+        self.head_amp = AmplitudeHeadV2(T=self.T, hdim=d_model, tdim=tdim, hidden=hidden, blocks=blocks, v_max=v_max_amp)
+        self.head_tr  = TrendHeadV2(T=self.T, hdim=d_model, tdim=tdim, hidden=hidden, Kd=K_trend, Kp=3,
+                                    v_max=v_max_tr, fs=self.fs, lp_win_sec=1.2)
+
+        self.decouple = SoftSpectralDecoupler(
+            fs=self.fs, f_trend_max=f_trend_max, f_amp_min=f_amp_min, f_amp_max=f_amp_max,
+            tau=dec_tau, learnable=dec_learnable
+        )
+
+        self.rel_corrector_strength = float(rel_corrector_strength)
+        self.rel_trend_only = bool(rel_trend_only)
+
+    def extract_conditions(self, video=None, mst=None):
+        assert video is not None, "This TPT strict model expects video input."
+        return self.backbone(video)
+
+    def decompose_target(self, rppg_gt):
+        y_amp, y_tr = self.decouple(rppg_gt)
+
+        std_amp = safe_std(y_amp, dim=1, keepdim=True)
+        z1_amp  = y_amp / std_amp
+
+        mu_tr  = y_tr.mean(dim=1, keepdim=True)
+        std_tr = safe_std(y_tr, dim=1, keepdim=True).clamp_min(self.trend_std_floor)
+        z1_tr  = (y_tr - mu_tr) / std_tr
+
+        stats = {'std_amp': std_amp, 'mu_tr': mu_tr, 'std_tr': std_tr}
+        return (z1_amp, z1_tr), stats
+
+    @staticmethod
+    def canonicalize_wave(y):
+        y = y - y.mean(dim=1, keepdim=True)
+        return y / safe_std(y, dim=1, keepdim=True)
+
+    def decode_latent(self, z_amp, z_tr, stats=None):
+        if stats is None:
+            return self.canonicalize_wave(z_amp + z_tr)
+        y_amp_hat = z_amp * stats['std_amp']
+        y_tr_hat  = z_tr * stats['std_tr'] + stats['mu_tr']
+        return y_amp_hat + y_tr_hat
+
+    @staticmethod
+    def sample_t(N, device, p_t0=0.0, t0_range=0.05):
+        if float(p_t0) <= 0.0:
+            return torch.rand(N, device=device)
+        u = torch.rand(N, device=device)
+        t = torch.rand(N, device=device)
+        t_small = torch.rand(N, device=device) * float(max(1e-6, t0_range))
+        return torch.where(u < float(p_t0), t_small, t)
+
+    @staticmethod
+    def sample_z0(N, T, device):
+        return torch.randn(N, T, device=device)
+
+    def _apply_rel(self, v_amp, v_tr, rel):
+        if rel is None or self.rel_corrector_strength <= 0:
+            return v_amp, v_tr
+        # rel: [N,T]
+        g = (rel - rel.mean(dim=1, keepdim=True)) * float(self.rel_corrector_strength)
+        if self.rel_trend_only:
+            v_tr = v_tr * (1.0 + g)
+        else:
+            v_amp = v_amp * (1.0 + g)
+            v_tr  = v_tr  * (1.0 + g)
+        return v_amp, v_tr
+
+    def velocity(self, zt_amp, zt_tr, t, h_glb, c_amp, c_tr, rel=None):
+        v_amp = self.head_amp(zt_amp, t, h_glb, c_amp)
+        v_tr  = self.head_tr(zt_tr,  t, h_glb, c_tr)
+        v_amp, v_tr = self._apply_rel(v_amp, v_tr, rel)
+        return v_amp, v_tr
+
+    def forward(self, video, rppg_gt, mst=None, p_t0=0.0, t0_range=0.05):
+        device = video.device
+        N, T = rppg_gt.shape
+        assert T == self.T
+
+        h_glb, c_amp, c_tr, rel = self.extract_conditions(video=video, mst=mst)
+        (z1_amp, z1_tr), stats = self.decompose_target(rppg_gt)
+
+        t = self.sample_t(N, device, p_t0=p_t0, t0_range=t0_range)
+        z0_amp = self.sample_z0(N, T, device)
+        z0_tr  = self.sample_z0(N, T, device)
+
+        zt_amp = (1.0 - t).unsqueeze(1) * z0_amp + t.unsqueeze(1) * z1_amp
+        zt_tr  = (1.0 - t).unsqueeze(1) * z0_tr  + t.unsqueeze(1) * z1_tr
+
+        v_amp, v_tr = self.velocity(zt_amp, zt_tr, t, h_glb, c_amp, c_tr, rel=rel)
+
+        # FM targets
+        tgt_v_amp = (z1_amp - z0_amp).detach()
+        tgt_v_tr_raw = (z1_tr - z0_tr).detach()
+        # strict: trend target projected into expressible space via SAME LP
+        tgt_v_tr = self.head_tr._lp(tgt_v_tr_raw)
+
+        # single-step bridge (aux only)
+        z1_amp_hat = zt_amp + (1.0 - t).unsqueeze(1) * v_amp
+        z1_tr_hat  = zt_tr  + (1.0 - t).unsqueeze(1) * v_tr
+        y1_hat_raw = self.decode_latent(z1_amp_hat, z1_tr_hat, stats=stats)
+
+        aux = {
+            "t": t.detach(),
+            "h_glb": h_glb,
+            "c_amp": c_amp,
+            "c_tr": c_tr,
+            "rel": rel,
+            "z0_amp": z0_amp,
+            "z0_tr": z0_tr,
+            "gt_canon": self.canonicalize_wave(rppg_gt).detach(),
+            "y1_hat_canon": self.decode_latent(z1_amp_hat, z1_tr_hat, stats=None),
+            "tgt_v_tr_raw": tgt_v_tr_raw,
+        }
+
+        pred_fields   = torch.stack([v_amp, v_tr], dim=1)
+        target_fields = torch.stack([tgt_v_amp, tgt_v_tr], dim=1)
+        return pred_fields, target_fields, y1_hat_raw, rppg_gt, aux
+
+    @torch.no_grad()
+    def predict(self, video=None, mst=None, steps=8, method="euler", z0_amp=None, z0_tr=None):
+        # strict: Euler-only (method kept for API compatibility)
+        self.eval()
+        h_glb, c_amp, c_tr, rel = self.extract_conditions(video=video, mst=mst)
+        N, T = c_amp.shape
+        device = h_glb.device
+
+        steps = max(1, int(steps))
+        dt = 1.0 / steps
+
+        z_amp = torch.randn(N, T, device=device) if z0_amp is None else z0_amp
+        z_tr  = torch.randn(N, T, device=device) if z0_tr  is None else z0_tr
+
+        for i in range(steps):
+            t0 = torch.full((N,), i * dt, device=device)
+            v_amp, v_tr = self.velocity(z_amp, z_tr, t0, h_glb, c_amp, c_tr, rel=rel)
+            z_amp = z_amp + dt * v_amp
+            z_tr  = z_tr  + dt * v_tr
+
+        return self.decode_latent(z_amp, z_tr, stats=None)
